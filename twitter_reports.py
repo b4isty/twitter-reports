@@ -1,12 +1,15 @@
 import itertools
 import re
-import requests
-import time
 from collections import Counter
+from datetime import timedelta
+
+import requests
 from requests.exceptions import TooManyRedirects
-from tweepy import API, OAuthHandler
+from tweepy import OAuthHandler, Stream
+from tweepy.streaming import StreamListener
 
 import twitter_credentials
+from helpers import custom_time_now
 
 keyword = input("Enter a keyword: ")
 
@@ -22,110 +25,150 @@ class TwitterAuthenticator(object):
         return auth
 
 
-class TwitterReports(object):
+class TwitterStreamer:
     """
-    class for generating reports based on a given keyword
+    Class for streaming and processing live tweets
     """
 
-    def __init__(self, keyword):
-        self.keyword = keyword
-        self.auth = TwitterAuthenticator().authenticate_twitter_app()
-        self.api = API(self.auth)
-        self.tweet_list = [[] for i in range(5)]
-        self.all_tweets = []
-        self.max_id = 0
+    def __init__(self):
+        self.twitter_auth = TwitterAuthenticator()
 
-    def tweets(self, with_since_id=False, since_id=None, max_id=None):
-        """
-        collecting tweets
-        """
-        # we need last 5(minutes) tweet list
-        self.tweet_list = self.tweet_list[:5]
-        if with_since_id:
-            tweets = self.api.search(q=keyword, count=80, since_id=since_id, max_id=max_id)
-        else:
-            tweets = self.api.search(q=keyword, count=80, tweet_mode='extended')
-        tweets = [i for i in tweets]
-        if tweets:
-            self.max_id = tweets[0].id
-        else:
-            self.max_id = self.max_id if self.max_id else 0
+    def stream_tweets(self, keyword):
+        listener = TwitterListener()
+        auth = self.twitter_auth.authenticate_twitter_app()
+        stream = Stream(auth, listener)
+        stream.filter(track=[keyword])
 
-        self.all_tweets = tweets
-        self.tweet_list.insert(0, self.all_tweets)
+
+class TwitterListener(StreamListener):
+    """
+    This is a listener that just prints received tweets to stdout
+    """
+    now = custom_time_now()
+
+    def __init__(self):
+        super(TwitterListener, self).__init__()
+
+        self.content_text = ""
+        self.raw_tweets = []
+        self.tweet_list = []
+        self.all_link_list = [[] for _ in range(5)]
+        self.link_list = []
+        self.error_link_list = []
+        self.all_tweets = [[] for _ in range(5)]
+        self.now = custom_time_now()
+        self.user_list = []
 
     def get_user_report(self):
         """
-        :return: blank string instead of NOne to make terminal clean
+        :return: blank string instead of None to make terminal clean
         """
         print("-------------------------------User Report--------------------------------")
-        for tweet in self.all_tweets:
-            print("User name: ", tweet.user.name)
-            print("Tweet Counts: ", tweet.user.statuses_count)
+        for user in self.user_list:
+            print("User name: ", user.name)
+            print("Tweet Counts: ", user.statuses_count)
         return ''
+
+    def get_tweet_text(self, status):
+        if hasattr(status, "retweeted_status"):  # Check if Retweetter
+            try:
+                text = status.retweeted_status.extended_tweet["full_text"]
+
+            except AttributeError:
+                text = status.retweeted_status.text
+        else:
+            try:
+                text = status.extended_tweet["full_text"]
+            except AttributeError:
+                text = status.text
+        self.tweet_list.append(text)
+        return text
+
+    def get_link(self, tweet):
+        """
+        finds link and store in a list
+        :return: clean text without link
+        """
+
+        p2 = re.compile(
+            r'(?:http|ftp|https)://(?:[\w_-]+(?:(?:\.[\w_-]+)+))(?:[\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?')
+        links = p2.findall(tweet)
+        content_text = ''
+
+        for link in links:
+            content_text = tweet.replace(link, '')
+            try:
+                expanded_link = requests.head(link, allow_redirects=True)
+            except TooManyRedirects:
+                self.error_list.append(link)
+                continue
+            if expanded_link.status_code != 404:
+                splited_link = expanded_link.url.split("/")
+                domain = f'{splited_link[0]}//{splited_link[2]}'
+                self.link_list.append(domain)
+            self.error_link_list.append(link)
+        if content_text:
+            return content_text
+        return tweet
 
     def get_link_report(self):
-        print("-------------------------------Link Report--------------------------------")
-        link_list = []
-        error_list = []
-
-        for tweet in itertools.chain.from_iterable(self.tweet_list):
-            # finding links
-            p2 = re.compile(
-                r'(?:http|ftp|https)://(?:[\w_-]+(?:(?:\.[\w_-]+)+))(?:[\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?')
-            links = p2.findall(tweet.full_text)
-            for link in links:
-                try:
-                    expanded_link = requests.head(link, allow_redirects=True)
-                except TooManyRedirects:
-                    # handling too many redirects error
-                    error_list.append(link)
-                    continue
-
-                if expanded_link.status_code != 404:
-                    splited_link = expanded_link.url.split("/")
-                    domain = f'{splited_link[0]}//{splited_link[2]}'
-                    link_list.append(domain)
-                error_list.append(link)
-        cnt = Counter(link_list)
+        print("----------------------------Link Report---------------------")
+        cleaned_links = itertools.chain.from_iterable(self.all_link_list)
+        cnt = Counter(cleaned_links)
         print("Number of links", len(cnt))
         print("list of unique domains", sorted(cnt, key=cnt.get, reverse=True))
-        return ''
 
     def content_report(self):
-        print("-------------------------------Content Report--------------------------------")
+
+        """
+        function to create content report based
+        on tweet list
+        """
+        print("----------------------------Content Report---------------------")
         content_list = []
         common_words = ["a", "an", "the", "of", "with", "at", "to", "into", "from", "in",
-                        "on", "by", "for", "and", "but", "am", "is", "are", "have", "has",
-                        "had", "was", "were", "will", "shall", "be"]
-        for tweet in itertools.chain.from_iterable(self.tweet_list):
-            # print("text**", tweet.full_text)
-            words_list = tweet.full_text.split()
-            for word in words_list:
-                if word.lower() not in common_words:
-                    content_list.append(word)
+                        "on", "by", "for", "and", "but", "or", "so", "you", "i", "am", "is",
+                        "are", "have", "has", "had", "was", "were", "will", "shall", "be", '']
+        tweet_list = itertools.chain.from_iterable(self.all_tweets)
+
+        words_list = ','.join(list(tweet_list)).split(' ')
+        for word in words_list:
+            if word.lower() not in common_words:
+                content_list.append(word)
         counter = Counter(content_list)
         print("No of unique words:", len(counter))
-        print("top ten words sorted by occurrence:", sorted(counter, key=counter.get, reverse=True)[:10])
+        print("top words sorted by occurrence:", sorted(counter, key=counter.get, reverse=True)[:10])
         return ''
 
+    def on_status(self, status):
+        self.user_list.append(status.user)
+        return self.runner(status)
 
-if __name__ == '__main__':
+    def on_error(self, status_code):
+        if status_code == 420:
+            return False
+        print(status_code)
 
-    twitter_reports = TwitterReports(keyword)
-    print(twitter_reports.tweets())
-    print(twitter_reports.get_user_report())
-    print(twitter_reports.get_link_report())
-    print(twitter_reports.content_report())
-    while True:
-        # def scheduled_runner():
-        """
-        function to run scheduled job
-        :return: blank string to keep the output clean
-        """
-        # waiting for 60 seconds
-        time.sleep(60)
-        twitter_reports.tweets(with_since_id=True, since_id=twitter_reports.max_id, max_id=twitter_reports.max_id + 100)
-        print(twitter_reports.get_user_report())
-        print(twitter_reports.get_link_report())
-        print(twitter_reports.content_report())
+    def runner(self, status):
+        full_text = self.get_tweet_text(status)
+        content = self.get_link(full_text)
+        self.tweet_list.append(content)
+
+        cur_time = custom_time_now()
+        if self.now + timedelta(seconds=60) == cur_time:
+            self.now = custom_time_now()
+            if self.tweet_list:
+                self.all_tweets.insert(0, self.tweet_list)
+                self.all_tweets = self.all_tweets[:5]
+            if self.link_list:
+                self.all_link_list.insert(0, self.link_list)
+                self.all_link_list = self.all_link_list[:5]
+            self.tweet_list = list()
+            self.link_list = []
+            self.get_user_report()
+            self.get_link_report()
+            self.content_report()
+
+
+twitter_streamer = TwitterStreamer()
+twitter_streamer.stream_tweets(keyword)
